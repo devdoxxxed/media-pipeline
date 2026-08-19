@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.db
+uploads/*
+!uploads/.gitkeep
+.env
+server.log
+test1.jpg
+test2.jpg
+.venv/
+venv/
