@@ -1,73 +1,236 @@
 # Intelligent Media Processing Pipeline
 
-Backend service that accepts vehicle image uploads, analyzes them
-asynchronously for common field-upload issues (blur, low light, duplicates,
-invalid plate format), and exposes status/results APIs to poll for outcomes.
+A FastAPI backend that accepts vehicle image uploads, processes them
+asynchronously against 4 quality checks, and exposes APIs to poll for
+results.
 
-See also: [`plan.md`](plan.md) (scope/checklist), [`workflow.md`](workflow.md)
-(request/processing flow), [`decision.md`](decision.md) (tech choices + why).
+**Checks:** blur detection · low light detection · duplicate image
+detection · number-plate format validation (OCR)
+
+---
 
 ## Architecture
+
+### Service flow
 
 ```
 Client
   |
   v
-FastAPI app (app/main.py)
-  |
-  |-- POST /upload -----------> saves file to disk, inserts DB row
-  |                              (status=pending), pushes job onto an
-  |                              in-process queue.Queue, returns 202 fast
-  |
-  |-- GET /status/{id} --------> reads current status from DB
-  |-- GET /results/{id} -------> reads results/verdict from DB (409 if not
-  |                              completed yet)
-  |-- GET /results/{id}/failure -> reads failure_reason (409 if not failed)
-  |
-  v
-Background worker thread (app/worker.py)
-  - single daemon thread, consumes job IDs from the queue
-  - sets status=processing -> runs 4 analysis checks -> status=completed/failed
-  - each check is independently wrapped in try/except so one bad check
-    doesn't fail the whole job
+POST /upload
+  - saves uploaded file to disk
+  - inserts a DB row (status=pending)
+  - pushes the job ID onto an in-process queue.Queue
+  - returns 202 Accepted immediately (does not wait for processing)
 
-Analysis checks (app/analysis/):
-  - blur.py        Laplacian variance (OpenCV)
-  - brightness.py  mean grayscale intensity
-  - duplicate.py   perceptual hash (imagehash) vs all prior completed jobs
-  - plate.py       pytesseract OCR + regex against Indian plate format
-
-Persistence: SQLite via SQLAlchemy (app/models.py) - one table, `image_jobs`,
-storing status, results (JSON), verdict, failure_reason, timestamps.
+GET /status/{id}           -> current status (pending/processing/completed/failed)
+GET /results/{id}          -> results + verdict (409 if not yet completed)
+GET /results/{id}/failure  -> failure reason (409 if not failed)
 ```
 
-Full request/processing sequence: see [`workflow.md`](workflow.md).
+### Processing flow
 
-## Why these choices (short version, full reasoning in decision.md)
+A single background daemon thread (`app/worker.py`) continuously pulls job
+IDs off the queue:
 
-- **FastAPI + SQLite + SQLAlchemy**: fast to run locally, zero external
-  services, auto-generated `/docs`, ORM makes a future Postgres swap a
-  connection-string change.
-- **In-process queue (`queue.Queue` + a worker thread)** instead of
-  Celery/Redis/RabbitMQ: the assignment says the choice matters less than the
-  reasoning. This gets the same architecture (decoupled async processing,
-  explicit state machine) without extra infrastructure to run/debug in the
-  time available. Documented trade-off: doesn't survive a process restart and
-  doesn't scale beyond one instance - noted as the first thing to change for
-  production.
-- **Heuristics, not ML models**, for the 4 checks: the brief explicitly says
-  accuracy isn't the target, structuring uncertainty is. Every check returns
-  a numeric score + threshold, not just a boolean, so results are explainable.
+```
+status = processing
+  -> run blur check
+  -> run brightness check
+  -> run duplicate check
+  -> run plate check
+  (each check wrapped independently in try/except - one check failing
+   does not fail the whole job or block the others)
+status = completed (or failed, if something outside the checks broke -
+  e.g. the image file itself is corrupt/unreadable)
+```
 
-## Running locally
+Analysis modules live in `app/analysis/`:
+- `blur.py` - Laplacian variance (OpenCV)
+- `brightness.py` - mean grayscale intensity
+- `duplicate.py` - perceptual hash (imagehash) compared against all prior
+  completed jobs
+- `plate.py` - HSV color + contour-based region detection, pytesseract OCR,
+  regex validation against Indian plate format (with fuzzy correction for
+  common OCR character confusions)
 
-Requires Python 3.10+ and the `tesseract-ocr` system package for the plate
-check (OCR degrades gracefully and reports `"ocr_available": false` if
-missing, rather than failing the job).
+Each check returns a numeric score + threshold + boolean, not just a
+pass/fail, so results are explainable rather than opaque.
+
+### Queue strategy
+
+In-process `queue.Queue` + a single worker thread, instead of
+Celery/Redis/RabbitMQ.
+
+**Why:** the assignment scope prioritizes reasoning over infrastructure
+choice. This gets the same *architecture* (decoupled async processing,
+explicit state machine, non-blocking upload endpoint) without external
+services to run/debug in the time available.
+
+**Documented trade-off:** this does not survive a process restart (queued
+jobs are lost if the app restarts) and does not scale beyond one process.
+See [Trade-offs](#trade-offs) below for the production path.
+
+### Major design decisions
+
+| Decision | Reasoning |
+|---|---|
+| FastAPI + SQLite + SQLAlchemy | Fast to run locally, zero external services, auto-generated `/docs`, ORM makes a future Postgres swap a connection-string change |
+| In-process queue over Celery/Redis | See Queue strategy above |
+| Heuristics, not ML models, for all 4 checks | Brief explicitly deprioritizes accuracy in favor of structuring uncertainty well; every check is explainable (score + threshold) |
+| Every check isolated in try/except | One check failing (e.g. OCR unavailable) shouldn't fail the whole job |
+| Plate detection returns `plate_detected: false` rather than a guess when uncertain | A confident wrong plate number is worse than an honest "couldn't verify" for a system meant to flag issues |
+
+---
+
+## AI Usage Disclosure (Mandatory)
+
+I used Claude throughout this build. Concretely:
+
+**Where AI helped:**
+- **Scaffolding & boilerplate**: FastAPI app structure, SQLAlchemy models,
+  Pydantic schemas, the worker thread pattern - AI-generated first draft.
+- **Analysis heuristics**: AI proposed the specific techniques (Laplacian
+  variance for blur, mean grayscale intensity for brightness, perceptual
+  hashing for duplicates, OCR+regex for plate format) and default
+  thresholds.
+- **Plate detection debugging**: this was the hardest part of the project.
+  AI helped iteratively debug why plate OCR was failing on real test
+  images - working through color-detection false positives (ad banners,
+  vehicle trim matching the plate's yellow color), aspect-ratio
+  assumptions that didn't account for two-line stacked plates, and OCR
+  character-confusion correction.
+- **Docs** (this README, `plan.md`, `workflow.md`, `decision.md`): drafted
+  with AI, corrected to match what was actually built.
+
+**How I validated AI-generated code (not just trusted it):**
+- Read every generated file to confirm DB session lifecycle (`get_db`
+  dependency, session-per-job in the worker) was correct - an easy place
+  to introduce connection leaks.
+- Ran the pipeline against real/synthetic sharp vs. blurry and bright vs.
+  dark images and confirmed scores landed on the correct side of each
+  threshold, rather than trusting the numbers blindly (see
+  `curl_examples.md` for captured real runs).
+- For plate detection specifically: added debug logging at every stage
+  (candidate region coordinates, OCR output per candidate, rejection
+  reasons) and manually cross-checked detected regions against the actual
+  plate location in test images, rather than assuming a "no errors thrown"
+  result meant it was working correctly.
+- Manually located ground-truth plate pixel coordinates in test images and
+  ran OCR against a known-correct crop to separate "is detection finding
+  the right region" from "is OCR reading it correctly" as two distinct
+  failure modes, instead of guessing which layer was broken.
+
+**Where AI output was wrong or needed correction:**
+- The first version of the background-server test setup used a plain
+  `&`-backgrounded process, which died as soon as the shell session
+  ended - fixed using `setsid` to properly detach it.
+- An early plate-detection fuzzy-matching approach (correcting OCR
+  character confusions) was too permissive: it tolerated enough
+  insertions/deletions that it started confidently matching the *wrong*
+  plate number out of noisy background text (valid format, wrong digits).
+  I caught this by testing it against known noisy OCR output before
+  deploying it, and scaled it back to a safer, substitution-only version
+  that only corrects individually-confusable characters (e.g. 0/O, 1/I,
+  2/Z) rather than tolerating extra/missing characters - a wrong confident
+  answer is worse than no answer for this use case.
+- Initial plate-region detection assumed single-line, elongated plates
+  (aspect ratio ~4:1+). Real test images included two-line stacked plates
+  (common on autos/two-wheelers in India, aspect ratio closer to ~2:1),
+  which the original filters rejected outright. Caught by manually
+  inspecting debug crops rather than trusting that "0 candidates found"
+  meant no plate was present.
+- Yellow-color-based plate detection assumed the plate would be visually
+  distinct from its surroundings. On auto-rickshaws, the vehicle body
+  itself is painted the same yellow as the plate, so color alone can't
+  separate them - confirmed by visualizing the raw color mask, not by
+  assumption. Documented as a known limitation rather than solved with
+  increasingly fragile heuristics.
+
+**What I did NOT let AI decide:** which requirements to cut for time, and
+the final call on queue architecture (in-process vs. Celery) - AI laid out
+the trade-off, I made the call given the time constraint.
+
+---
+
+## Trade-offs
+
+### What I intentionally simplified
+
+- **No retries**: a failed job stays failed. Production version would add
+  a retry count + exponential backoff before marking failed.
+- **In-process queue**: single point of failure, no horizontal scaling
+  (see Queue strategy above).
+- **SQLite**: fine for this scale; would move to Postgres for concurrent
+  writes and JSONB indexing on `results` at real scale.
+- **Plate OCR accuracy**: heuristic color/contour detection + pytesseract,
+  not a trained plate-detection model. Reads plates reliably when
+  reasonably visible; correctly reports low confidence rather than
+  guessing on harder images (plate flush against same-colored vehicle
+  trim, heavy glare, ad wraps covering most of the frame). See
+  `decision.md` for the specific debugging process.
+- **No screenshot / photo-of-photo / tamper detection**: needs stronger
+  signals (EXIF presence, moire pattern detection, recompression
+  artifacts) to be meaningfully better than a coin flip. Skipped rather
+  than shipped as a fake check.
+- **Duplicate detection is O(n)** per upload (scans all prior completed
+  jobs' hashes). Fine at hundreds/thousands of rows; would need an
+  indexed hash-bucket or vector search structure at real scale.
+- **No auth, no rate limiting**: explicitly bonus-tier per the brief, cut
+  to protect time for core requirements + documentation.
+- **No Docker**: see Running Instructions below for the manual setup used
+  instead.
+
+### What I'd improve with more time
+
+1. A trained plate-detection model (or a cloud OCR/ANPR API) in place of
+   the color+contour heuristic - this is the clearest accuracy upgrade
+   path for the plate check specifically.
+2. Screenshot/tamper heuristics (EXIF check, moire detection via FFT,
+   recompression artifact analysis).
+3. Swap in-process queue for Redis+RQ (interface barely changes) for
+   restart-safety and multi-instance scaling.
+4. Docker Compose for one-command spin-up.
+5. Retry policy with backoff and a `retry_count` column.
+6. Confidence scoring that combines all 4 check scores into a single
+   weighted "issue confidence" rather than a boolean verdict.
+7. Real unit tests per analysis module (currently one end-to-end smoke
+   test).
+
+### Scalability concerns (honest assessment)
+
+- Single worker thread processes jobs strictly one at a time - no
+  concurrency. A real system would run N worker processes/pods pulling
+  from a shared broker.
+- Duplicate-hash scan is linear in total completed jobs.
+- SQLite write-locks the whole file per transaction - a real
+  concurrent-write workload needs Postgres.
+
+### Failure handling concerns (honest assessment)
+
+- If the worker thread itself crashes (not just a per-job exception), no
+  jobs currently in `pending`/`processing` will ever complete - there's no
+  supervisor to restart it. Production version would run the worker as a
+  separate supervised process (systemd/Docker restart policy) rather than
+  a thread inside the API process.
+- Corrupt/unreadable images are caught (`cv2.imread` returning `None`) and
+  correctly marked `failed` with a reason - verified in testing.
+- Each of the 4 checks is independently try/except-wrapped, so e.g. OCR
+  being unavailable on a host doesn't fail blur/brightness/duplicate
+  results for that job - `plate_format.ocr_available` reports `false`
+  instead.
+
+---
+
+## Running Instructions
+
+Requires Python 3.10+ and the `tesseract-ocr` system package (OCR degrades
+gracefully - reports `"ocr_available": false` rather than failing the job
+if missing).
 
 ```bash
-# 1. System dependency for OCR (skip if already installed)
-sudo apt-get install -y tesseract-ocr
+# 1. System dependency for OCR
+sudo apt-get install -y tesseract-ocr    # macOS: brew install tesseract
 
 # 2. Python deps
 python3 -m venv .venv && source .venv/bin/activate
@@ -82,99 +245,25 @@ uvicorn app.main:app --reload
 # Interactive API docs: http://localhost:8000/docs
 ```
 
-## Trying it out
+### Test scripts
 
-See [`curl_examples.md`](curl_examples.md) for real captured request/response
-pairs, or run the end-to-end smoke test against a running server:
-
+End-to-end smoke test against a running server:
 ```bash
 python tests/test_api.py
 ```
 
-## AI Usage Disclosure
+Real captured request/response pairs: [`curl_examples.md`](curl_examples.md)
 
-I used Claude throughout this build. Concretely:
+### Docker
 
-- **Scaffolding & boilerplate**: FastAPI app structure, SQLAlchemy models,
-  Pydantic schemas, the worker thread pattern - AI-generated first draft,
-  then I read through each file to confirm the DB session lifecycle
-  (`get_db` dependency, session-per-job in the worker) was correct, since
-  that's an easy place to introduce connection leaks.
-- **Analysis heuristics**: AI proposed the specific techniques (Laplacian
-  variance for blur, mean grayscale intensity for brightness, perceptual
-  hashing for duplicates, OCR+regex for plate format) and default thresholds.
-  I validated these by actually running the pipeline against synthetic
-  sharp/blurry and bright/dark test images and checking the scores landed on
-  the correct side of the threshold (see `tests/test_api.py` and the manual
-  runs recorded in `curl_examples.md`) rather than trusting the numbers
-  blindly.
-- **Where AI output was wrong / needed correction**: the first version of the
-  background-server test setup used a plain `&`-backgrounded process, which
-  died as soon as the shell session ended - had to fix by using `setsid` to
-  properly detach it. This is an infra/testing detail, not application code,
-  but it's a real example of validating rather than trusting AI-run commands.
-  Also, the initial plate regex assumed OCR would cleanly return uppercase
-  alphanumerics; real Tesseract output on the test image included stray
-  spaces and mis-read `0` as `O`, which is expected OCR noise, not a bug -
-  documented under Trade-offs below rather than "fixed" with over-fitted
-  regex hacks.
-- **Docs (plan/workflow/decision.md, this README)**: drafted with AI,
-  reviewed and kept in sync with what was actually built, not written
-  aspirationally before the code existed.
-- **What I did NOT let AI decide**: which requirements to cut for time (I set
-  that scope), and the final call on queue architecture (in-process vs
-  Celery) - AI laid out the trade-off, I made the call given the 48h/time
-  constraint.
+Not included - see [Trade-offs](#trade-offs) for reasoning and the
+documented upgrade path (Docker Compose for one-command spin-up).
 
-## Trade-offs (what I intentionally simplified)
+---
 
-- **No retries**: a failed job stays failed. Production version would add a
-  retry count + exponential backoff before marking failed.
-- **In-process queue**: single point of failure, no horizontal scaling. See
-  decision.md for the swap-to-Redis/Celery path.
-- **SQLite**: fine for this scale; would move to Postgres for concurrent
-  writes and JSONB indexing on `results` at real scale.
-- **OCR accuracy**: pytesseract on a synthetic/photographed plate is noisy
-  (confuses `0`/`O`, sensitive to angle/lighting). A production system would
-  use a cloud OCR API or a plate-specific detection model; documented as the
-  clearest accuracy upgrade path.
-- **No screenshot / photo-of-photo / tamper detection**: these need stronger
-  signals (EXIF presence, moire pattern detection, recompression artifacts)
-  to be meaningfully better than a coin flip. Skipped rather than shipped as
-  a fake check - listed under "what I'd improve" below.
-- **Duplicate detection is O(n)** per upload (scans all prior completed
-  jobs' hashes). Fine at hundreds/thousands of rows; would need an indexed
-  hash-bucket or vector search structure at real scale.
-- **No auth, no rate limiting**: explicitly bonus-tier per the brief, cut to
-  protect time for core requirements + documentation.
+## Further reading
 
-## What I'd improve with more time
-
-1. Screenshot/tamper heuristics (EXIF check, moire detection via FFT,
-   recompression artifact analysis)
-2. Swap in-process queue for Redis+RQ (interface barely changes - see
-   decision.md) for restart-safety and multi-instance scaling
-3. Docker Compose for one-command spin-up
-4. Retry policy with backoff and a `retry_count` column
-5. Confidence scoring that combines all 4 check scores into a single
-   weighted "issue confidence" rather than a boolean verdict
-6. Real unit tests per analysis module (currently one end-to-end smoke test)
-
-## Scalability concerns (honest assessment)
-
-- Single worker thread processes jobs strictly one at a time - no
-  concurrency. Fine for a take-home; a real system would run N worker
-  processes/pods pulling from a shared broker.
-- Duplicate-hash scan is linear in total completed jobs.
-- SQLite write-locks the whole file per transaction - a real concurrent-write
-  workload needs Postgres.
-
-## Failure handling concerns (honest assessment)
-
-- If the worker thread itself crashes (not just a per-job exception), no
-  jobs currently in `pending`/`processing` will ever complete - there's no
-  supervisor to restart it. A production version would run the worker as a
-  separate supervised process (systemd/Docker restart policy) rather than a
-  thread inside the API process.
-- Corrupt/unreadable images are caught (`cv2.imread` returning `None`) and
-  correctly marked `failed` with a reason - verified in testing.
+- [`plan.md`](plan.md) - scope/checklist
+- [`workflow.md`](workflow.md) - detailed request/processing sequence
+- [`decision.md`](decision.md) - extended technical decision log,
+  including the full plate-detection debugging process

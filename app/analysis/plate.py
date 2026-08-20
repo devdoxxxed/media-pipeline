@@ -37,12 +37,32 @@ def _looks_like_date(text: str) -> bool:
     return bool(date_pattern.fullmatch(text))
 
 
-def _find_plate(text: str):
+# Valid Indian state/UT registration codes. Used to reject
+# format-matching-but-nonsense results like "YI5S5447" - a string
+# can satisfy the regex shape and still not be a real plate.
+_VALID_STATE_CODES = {
+    "AP", "AR", "AS", "BR", "CG", "CH", "DD", "DL", "DN", "GA",
+    "GJ", "HP", "HR", "JH", "JK", "KA", "KL", "LA", "LD", "MH",
+    "ML", "MN", "MP", "MZ", "NL", "OD", "OR", "PB", "PY", "RJ",
+    "SK", "TN", "TR", "TS", "UK", "UP", "WB", "AN",
+}
+
+
+def _has_valid_state_code(candidate: str) -> bool:
+    return candidate[:2] in _VALID_STATE_CODES
+
+
+def _find_plate(text: str, allow_fuzzy: bool = True):
     """
     Search OCR output for an Indian vehicle registration number.
     Tries an exact match first, then falls back to correcting common
     OCR character confusions (0/O, 1/I, 2/Z, 5/S, 8/B, H/N, etc.)
     before giving up.
+
+    allow_fuzzy=False disables the fuzzy-correction fallback - use
+    this for low-confidence sources (like a brute-force full-image
+    OCR sweep) where fuzzy correction is more likely to bend noise
+    into a false positive than to fix a real misread.
     """
 
     normalized = re.sub(
@@ -55,6 +75,9 @@ def _find_plate(text: str):
 
     if exact:
         return exact
+
+    if not allow_fuzzy:
+        return None
 
     return _find_plate_fuzzy(normalized)
 
@@ -90,6 +113,13 @@ def _find_plate_exact(normalized: str):
         if _looks_like_date(candidate):
             logger.debug(
                 "Rejected date-like OCR candidate: %s",
+                candidate,
+            )
+            continue
+
+        if not _has_valid_state_code(candidate):
+            logger.debug(
+                "Rejected OCR candidate with invalid state code: %s",
                 candidate,
             )
             continue
@@ -159,7 +189,7 @@ def _find_plate_fuzzy(normalized: str, max_substitutions: int = 2):
 
                     if pattern.fullmatch(variant) and not _looks_like_date(
                         variant
-                    ):
+                    ) and _has_valid_state_code(variant):
                         logger.info(
                             "Fuzzy-matched plate: %s (from %s, "
                             "%d substitution(s))",
@@ -1024,28 +1054,26 @@ def check_plate(image_bgr, image_tag="image") -> dict:
             h = candidate["h"]
 
             # Add small padding around plate.
-            padding_x = int(w * 0.12)
-            padding_y = int(h * 0.35)
+            # Generously oversized, centered crop instead of tight
+            # padding. Precise localization keeps being slightly off
+            # (missing a character on one edge or another) - instead
+            # of chasing that, just grab a much bigger area around
+            # the candidate's center. The regex/fuzzy matcher scans
+            # the whole OCR string for a valid plate substring, so
+            # extra background noise around it doesn't hurt - it
+            # only fails if the crop is too TIGHT and cuts the plate
+            # itself.
 
-            x1 = max(
-                0,
-                x - padding_x,
-            )
+            cx = x + w // 2
+            cy = y + h // 2
 
-            y1 = max(
-                0,
-                y - padding_y,
-            )
+            crop_w = max(w * 2, 180)
+            crop_h = max(h * 3, 150)
 
-            x2 = min(
-                image_width,
-                x + w + padding_x,
-            )
-
-            y2 = min(
-                image_height,
-                y + h + padding_y,
-            )
+            x1 = max(0, cx - crop_w // 2)
+            y1 = max(0, cy - crop_h // 2)
+            x2 = min(image_width, cx + crop_w // 2)
+            y2 = min(image_height, cy + crop_h // 2)
 
             crop = image_bgr[
                 y1:y2,
@@ -1122,7 +1150,12 @@ def check_plate(image_bgr, image_tag="image") -> dict:
                     text,
                 )
 
-                plate = _find_plate(text)
+                # allow_fuzzy=False here: this is a brute-force sweep
+                # of a large, noisy region (grille mesh, shadows,
+                # etc). Fuzzy correction on this much noise produces
+                # false positives like "YI5S5447" from grille
+                # texture. Only trust an exact match from this path.
+                plate = _find_plate(text, allow_fuzzy=False)
 
                 if plate:
 
